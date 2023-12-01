@@ -1,0 +1,101 @@
+#!/bin/bash
+
+prog_name=$(basename "$0")
+
+sub_help(){
+    echo "Usage: $prog_name <subcommand> [options]"
+    echo "Subcommands:"
+    echo "  install <id> <episode>"
+    echo ""
+}
+
+fetch_anime_info() {
+    local id="$1"
+    curl -s "https://api.gazes.fr/anime/animes/$id"
+}
+
+get_title() {
+    local anime="$1"
+    echo "$anime" | jq -r '.data.title | ascii_downcase | gsub(" ";"-")'
+}
+
+get_episode_count() {
+    local anime="$1"
+    echo "$anime" | jq -r '.data.episodes | length'
+}
+
+download_episode() {
+    local id="$1"
+    local episode="${2:-1}"
+
+    local anime
+    anime=$(fetch_anime_info "$id")
+    local title
+    title=$(get_title "$anime")
+    local episodes
+    episodes=$(get_episode_count "$anime")
+
+    if [[ "$title" == "null" ]]; then
+        echo "This anime does not exist."
+        exit 1
+    fi
+
+    if [[ "$episode" == *".."* ]]; then
+        local from=$(echo "$episode" | awk -F' +|[.][.]' '/^[^#]/{print $1}')
+        local to=$(echo "$episode" | awk -F' +|[.][.]' '/^[^#]/{print $2}')
+        
+        echo "Downloading episodes $from to $to"
+        
+        for ((i = from; i <= to; i++)); do
+            download_episode "$id" "$i"
+            sleep 1
+        done
+
+        return
+    fi
+
+    local video_url
+    video_url=$(curl -s "https://api.gazes.fr/anime/animes/$id/$episode" | jq -r '.data.vostfr.videoUri')
+
+    local episode_file="$title/episode-$episode.mkv"
+
+    [ -f "$episode_file" ] && rm "$episode_file"
+
+    mkdir -p "$title"
+
+    start=$(date +%s)
+    
+    ffmpeg -loglevel quiet -i "$video_url" -c copy -bsf:a aac_adtstoasc "$episode_file" &
+    ffmpeg_pid=$!
+
+    echo ""
+    echo "Downloading $title episode $episode"
+
+    spinner="/-\\|"
+    while kill -0 $ffmpeg_pid 2>/dev/null; do
+        for i in $(seq 0 3); do
+            echo -ne "\r${spinner:$i:1} "
+            sleep 0.1
+        done
+    done
+
+    end=$(date +%s)
+    echo -e "\rDownloaded $(du -h "$episode_file" | cut -f1) in $(expr $end - $start) seconds.\n"
+}
+
+subcommand=$1
+case $subcommand in
+    "" | "-h" | "--help")
+        sub_help
+        ;;
+    *)
+        shift
+        download_episode "$subcommand" "$@"
+        if [ $? = 127 ]; then
+            echo "Error: '$subcommand' is not a known subcommand." >&2
+            echo "       Run '$prog_name --help' for a list of known subcommands." >&2
+            exit 1
+        fi
+        ;;
+esac
+
