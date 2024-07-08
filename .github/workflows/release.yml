@@ -18,7 +18,7 @@ jobs:
           go-version-file: "go.mod"
 
       - name: Build project
-        run: go build . -o gazes
+        run: go build -o gazes .
 
       - name: Release
         uses: softprops/action-gh-release@v1
