@@ -4,6 +4,7 @@
 // : o )      _  (
 // "`-....,--; `-.\
 //     `'
+// https://puffer.fish/~l31
 
 package main
 
