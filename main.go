@@ -1,3 +1,10 @@
+// l31   /\
+//     _/./
+//  ,-'    `-:..-'/
+// : o )      _  (
+// "`-....,--; `-.\
+//     `'
+
 package main
 
 import (
@@ -12,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -24,11 +32,12 @@ func main() {
 }
 
 func watch(args []string) {
-	var episode int
+	var startEpisode, endEpisode int
 	var lang string
 
 	flagSet := flag.NewFlagSet("watch", flag.ExitOnError)
-	flagSet.IntVar(&episode, "e", 1, "episode number")
+	flagSet.IntVar(&startEpisode, "start", 1, "start episode number")
+	flagSet.IntVar(&endEpisode, "end", 1, "end episode number")
 	flagSet.StringVar(&lang, "l", "vostfr", "language")
 	flagSet.Parse(args)
 
@@ -37,15 +46,29 @@ func watch(args []string) {
 		log.Fatal("Title is required")
 	}
 
+	if endEpisode < startEpisode {
+		endEpisode = startEpisode
+	}
+
 	encodedTitle := url.QueryEscape(title)
 	animeID, realTitle := fetchAnimeInfo(encodedTitle)
-	animeVideo := fetchAnimeVideo(animeID, episode, lang)
 
-	tempFile := createTempFile(realTitle, episode)
-	downloadAnimeVideo(animeVideo, tempFile)
-	modifyTempFile(tempFile)
+	// Create a temporary directory for storing downloaded files and playlist
+	tempDir := createTempDir(realTitle)
+	defer os.RemoveAll(tempDir)
 
-	playAnime(tempFile)
+	playlistFile := filepath.Join(tempDir, "playlist.m3u8")
+	createPlaylist(playlistFile)
+
+	for episode := startEpisode; episode <= endEpisode; episode++ {
+		animeVideo := fetchAnimeVideo(animeID, episode, lang)
+		tempFile := createTempFile(tempDir, realTitle, episode)
+		downloadAnimeVideo(animeVideo, tempFile)
+		modifyTempFile(tempFile)
+		appendToPlaylist(playlistFile, tempFile)
+	}
+
+	playAnime(playlistFile)
 }
 
 func fetchAnimeInfo(title string) (int, string) {
@@ -103,14 +126,43 @@ func fetchAnimeVideo(animeID, episode int, lang string) string {
 	return video.VideoURI
 }
 
-func createTempFile(realTitle string, episode int) string {
+func createTempDir(realTitle string) string {
 	bytes := make([]byte, 16)
 	if _, err := rand.Read(bytes); err != nil {
 		log.Fatalf("Error generating random bytes: %v", err)
 	}
 
-	tempFileName := fmt.Sprintf("/tmp/%s_%d_%s.m3u8", realTitle, episode, hex.EncodeToString(bytes))
-	return tempFileName
+	tempDir := fmt.Sprintf("/tmp/%s_%s", realTitle, hex.EncodeToString(bytes))
+	if err := os.Mkdir(tempDir, 0755); err != nil {
+		log.Fatalf("Error creating temp directory: %v", err)
+	}
+
+	return tempDir
+}
+
+func createTempFile(tempDir, realTitle string, episode int) string {
+	tempFileName := fmt.Sprintf("%s_%d.m3u8", realTitle, episode)
+	return filepath.Join(tempDir, tempFileName)
+}
+
+func createPlaylist(playlistFile string) {
+	file, err := os.Create(playlistFile)
+	if err != nil {
+		log.Fatalf("Error creating playlist file: %v", err)
+	}
+	defer file.Close()
+}
+
+func appendToPlaylist(playlistFile, tempFile string) {
+	file, err := os.OpenFile(playlistFile, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		log.Fatalf("Error opening playlist file: %v", err)
+	}
+	defer file.Close()
+
+	if _, err := file.WriteString(fmt.Sprintf("%s\n", tempFile)); err != nil {
+		log.Fatalf("Error writing to playlist file: %v", err)
+	}
 }
 
 func downloadAnimeVideo(animeVideo, tempFile string) {
@@ -142,8 +194,8 @@ func modifyTempFile(tempFile string) {
 	}
 }
 
-func playAnime(tempFile string) {
-	cmd := exec.Command("vlc", tempFile)
+func playAnime(playlistFile string) {
+	cmd := exec.Command("vlc", "--playlist-autostart", playlistFile)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
