@@ -1,0 +1,158 @@
+#!/bin/bash
+
+reset="\e[0m"
+bg_cyan="\e[46m"
+fg_white="\e[97m"
+fg_black="\e[30m"
+
+subcommand=$1
+pids=()
+
+cleanup() {
+  echo "Cleaning up..."
+  kill "${pids[@]}" >/dev/null 2>&1
+  stop_spinner
+  echo "All processes should be terminated now."
+  echo -e "${reset}Exiting gracefully."
+  exit 1
+}
+
+trap 'cleanup' SIGINT SIGTERM
+
+error() {
+  echo
+  echo -e "  \033[48;2;255;0;0m Error ${reset}\033[38;2;255;0;0m $1"
+  echo
+}
+
+code_block() {
+  echo -e "\e[48;2;18;23;28m\e[38;2;89;116;143m $1 \e[0m"
+}
+
+print_usage() {
+  echo
+  echo -e "  ${bg_cyan}${fg_black} Usage ${reset} $0 $(code_block "download | watch") $(code_block "[...OPTIONS]") $(code_block title)"
+  echo
+  echo "    -l : vf or vostfr"
+  echo -e "    -r : range of episodes (e.g., $(code_block 1..5), $(code_block 1), $(code_block 1..))"
+  echo "    -h : show this message"
+  echo
+}
+
+while getopts "l:r:h" flag; do
+  case $flag in
+  r)
+    export range=$OPTARG
+    ;;
+  h)
+    print_usage
+    exit 0
+    ;;
+  \?)
+    echo "Invalid option: -$OPTARG" >&2
+    print_usage
+    exit 1
+    ;;
+  esac
+done
+
+if [[ $subcommand != "download" ]] && [[ $subcommand != "watch" ]]; then
+  error "Invalid subcommand $1"
+  print_usage
+  exit 1
+fi
+
+if [[ -z $subcommand ]]; then
+  print_usage
+  exit 1
+fi
+
+api="https://api.gazes.fr/anime"
+
+# download
+getAnime() {
+  local result=$(curl -s "${api}/animes" | jq -r .data)
+  local title=$(echo "$result" | jq -r '.[].title' | fzf | sed 's/"/\\"/g')
+
+  if [[ -z $title ]]; then
+    exit
+  fi
+
+  local anime=$(echo "$result" | jq -r ".[] | select(.title == \"$title\")")
+  local anime_id=$(echo "$anime" | jq -r ".id")
+  anime=$(curl -s "${api}/animes/${anime_id}")
+
+  echo $anime
+}
+
+start_spinner() {
+  gum spin --spinner dot --title "Downloading..." -- sleep infinity &
+  spinner_pid=$!
+}
+
+stop_spinner() {
+  kill $spinner_pid
+  wait $spinner_pid 2>/dev/null
+}
+
+download() {
+  local anime=$(getAnime)
+
+  if [[ -z $anime ]]; then
+    error "Please select an anime"
+    exit 1
+  fi
+
+  local anime_id=$(echo "$anime" | jq -r ".data.id")
+  local anime_title=$(echo "$anime" | jq -r ".data.title")
+
+  local selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
+
+  if [[ -z $selected_episodes ]]; then
+    error "You must select at least one episode"
+    exit 1
+  fi
+
+  local lang=$(gum choose --height 4 --header "language" {vf,vostfr})
+
+  if [[ -z $lang ]]; then
+    error "You exited badly"
+    exit 1
+  fi
+
+  IFS=$'\n' read -r -d '' -a episodes <<<"$selected_episodes"
+
+  for episode in "${episodes[@]}"; do
+    {
+      local episode_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .num")
+      local episode_full=$(curl -s "${api}/animes/${anime_id}/${episode_num}")
+      local episode_url=$(echo "$episode_full" | jq -r ".data.${lang}.videoUri // .data.vostfr.videoUri")
+
+      if curl --output /dev/null --silent --head --fail "$episode_url"; then
+        local tmp_folder="./$anime_title/$episode_num.mp4"
+        mkdir -p "$(dirname "$tmp_folder")"
+
+        if ffmpeg -loglevel error -i "$episode_url" -c copy "$tmp_folder"; then
+          echo "Downloaded episode $episode_num successfully."
+        else
+          echo "Failed to download episode $episode_num."
+        fi
+      else
+        echo "Episode URL $episode_url not accessible."
+      fi
+    } &
+    pids+=($!)
+  done
+
+  start_spinner
+  wait "${pids[@]}"
+  stop_spinner
+
+  echo "Download completed."
+}
+
+case "$1" in
+download)
+  download
+  ;;
+esac
