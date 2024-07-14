@@ -1,11 +1,6 @@
 #!/bin/bash
 
-reset="\e[0m"
-bg_cyan="\e[46m"
-fg_white="\e[97m"
-fg_black="\e[30m"
-
-subcommand=$1
+api="https://api.gazes.fr/anime"
 pids=()
 
 cleanup() {
@@ -13,80 +8,15 @@ cleanup() {
   kill "${pids[@]}" >/dev/null 2>&1
   stop_spinner
   echo "All processes should be terminated now."
-  echo -e "${reset}Exiting gracefully."
+  echo "Exiting gracefully."
   exit 1
 }
 
 trap 'cleanup' SIGINT SIGTERM
 
-error() {
-  echo
-  echo -e "  \033[48;2;255;0;0m Error ${reset}\033[38;2;255;0;0m $1"
-  echo
-}
-
-code_block() {
-  echo -e "\e[48;2;18;23;28m\e[38;2;89;116;143m $1 \e[0m"
-}
-
-print_usage() {
-  echo
-  echo -e "  ${bg_cyan}${fg_black} Usage ${reset} $0 $(code_block "download | watch") $(code_block "[...OPTIONS]") $(code_block title)"
-  echo
-  echo "    -l : vf or vostfr"
-  echo -e "    -r : range of episodes (e.g., $(code_block 1..5), $(code_block 1), $(code_block 1..))"
-  echo "    -h : show this message"
-  echo
-}
-
-while getopts "l:r:h" flag; do
-  case $flag in
-  r)
-    export range=$OPTARG
-    ;;
-  h)
-    print_usage
-    exit 0
-    ;;
-  \?)
-    echo "Invalid option: -$OPTARG" >&2
-    print_usage
-    exit 1
-    ;;
-  esac
-done
-
-if [[ $subcommand != "download" ]] && [[ $subcommand != "watch" ]]; then
-  error "Invalid subcommand $1"
-  print_usage
-  exit 1
-fi
-
-if [[ -z $subcommand ]]; then
-  print_usage
-  exit 1
-fi
-
-api="https://api.gazes.fr/anime"
-
-# download
-getAnime() {
-  local result=$(curl -s "${api}/animes" | jq -r .data)
-  local title=$(echo "$result" | jq -r '.[].title' | fzf | sed 's/"/\\"/g')
-
-  if [[ -z $title ]]; then
-    exit
-  fi
-
-  local anime=$(echo "$result" | jq -r ".[] | select(.title == \"$title\")")
-  local anime_id=$(echo "$anime" | jq -r ".id")
-  anime=$(curl -s "${api}/animes/${anime_id}")
-
-  echo $anime
-}
-
 start_spinner() {
-  gum spin --spinner dot --title "Downloading..." -- sleep infinity &
+  local message="Downloading $total_episodes episodes..."
+  gum spin --spinner dot --title "$message" -- sleep infinity &
   spinner_pid=$!
 }
 
@@ -95,64 +25,140 @@ stop_spinner() {
   wait $spinner_pid 2>/dev/null
 }
 
+get_anime() {
+  local result=$(curl -s "${api}/animes" | jq -r .data)
+  local title=$(echo "$result" | jq -r '.[].title' | fzf)
+
+  if [[ -z $title ]]; then
+    exit 1
+  fi
+
+  local anime=$(echo "$result" | jq -r ".[] | select(.title == \"$title\")")
+  local anime_id=$(echo "$anime" | jq -r ".id")
+  anime=$(curl -s "${api}/animes/${anime_id}")
+
+  echo "$anime"
+}
+
+sanitize_filename() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_-' | tr ' ' '_'
+}
+
+download_episode() {
+  local anime_title="$1"
+  local episode_num="$2"
+  local episode_url="$3"
+  local folder="$4"
+
+  local sanitized_title=$(sanitize_filename "$anime_title")
+  local output_file="$folder/$sanitized_title/episode_${episode_num}.mp4"
+  mkdir -p "$folder/$sanitized_title"
+
+  if ffmpeg -loglevel error -i "$episode_url" -c copy "$output_file"; then
+    echo "Downloaded episode $episode_num successfully."
+    update_playlist "$folder" "$sanitized_title"
+  else
+    echo "Failed to download episode $episode_num."
+  fi
+}
+
+update_playlist() {
+  local folder="$1"
+  local anime_title="$2"
+  local playlist_path="$folder/$anime_title/playlist.m3u8"
+
+  echo "#EXTM3U" >"$playlist_path"
+  for ep_file in $(ls "$folder/$anime_title"/*.mp4 | sort -V); do
+    realpath "$ep_file" >>"$playlist_path"
+  done
+}
+
+create_playlist() {
+  local folder="$1"
+  local playlist_path="$folder/playlist.m3u8"
+
+  if [[ ! -d $folder ]]; then
+    echo "Folder '$folder' does not exist."
+    exit 1
+  fi
+
+  echo "#EXTM3U" >"$playlist_path"
+  for ep_file in $(ls "$folder"/*.mp4 | sort -V); do
+    realpath "$ep_file" >>"$playlist_path"
+  done
+
+  echo "Playlist created at $playlist_path"
+}
+
 download() {
-  local anime=$(getAnime)
+  local folder="${2:-.}" # Default to current directory if folder not specified
+  local anime=$(get_anime)
 
   if [[ -z $anime ]]; then
-    error "Please select an anime"
+    echo "Please select an anime"
     exit 1
   fi
 
   local anime_id=$(echo "$anime" | jq -r ".data.id")
-  local anime_title=$(echo "$anime" | jq -r ".data.title")
-
+  local anime_title=$(echo "$anime" | jq -r ".data.title" | sed 's/"/\\"/g')
   local selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
 
   if [[ -z $selected_episodes ]]; then
-    error "You must select at least one episode"
+    echo "You must select at least one episode"
     exit 1
   fi
 
-  local lang=$(gum choose --height 4 --header "language" {vf,vostfr})
+  local lang=$(gum choose --height 4 --header "Language" {vf,vostfr})
 
   if [[ -z $lang ]]; then
-    error "You exited badly"
+    echo "Language selection required"
     exit 1
   fi
 
   IFS=$'\n' read -r -d '' -a episodes <<<"$selected_episodes"
 
+  total_episodes=${#episodes[@]}
+
+  start_spinner
+
   for episode in "${episodes[@]}"; do
-    {
+    (
       local episode_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .num")
       local episode_full=$(curl -s "${api}/animes/${anime_id}/${episode_num}")
       local episode_url=$(echo "$episode_full" | jq -r ".data.${lang}.videoUri // .data.vostfr.videoUri")
 
       if curl --output /dev/null --silent --head --fail "$episode_url"; then
-        local tmp_folder="./$anime_title/$episode_num.mp4"
-        mkdir -p "$(dirname "$tmp_folder")"
-
-        if ffmpeg -loglevel error -i "$episode_url" -c copy "$tmp_folder"; then
-          echo "Downloaded episode $episode_num successfully."
-        else
-          echo "Failed to download episode $episode_num."
-        fi
+        download_episode "$anime_title" "$episode_num" "$episode_url" "$folder"
       else
         echo "Episode URL $episode_url not accessible."
       fi
-    } &
+    ) &
     pids+=($!)
   done
 
-  start_spinner
   wait "${pids[@]}"
   stop_spinner
 
   echo "Download completed."
 }
 
+print_usage() {
+  echo "Usage: $0 download|playlist [folder]"
+  exit 1
+}
+
 case "$1" in
 download)
-  download
+  download "$@"
+  ;;
+playlist)
+  if [[ -z $2 ]]; then
+    echo "Please specify the folder."
+    exit 1
+  fi
+  create_playlist "$2"
+  ;;
+*)
+  print_usage
   ;;
 esac
