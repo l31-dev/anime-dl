@@ -5,12 +5,18 @@ api="https://api.gazes.fr/anime"
 
 pids=()
 spinner_pid=""
+vlc_pid=""
 
 cleanup() {
   echo "Cleaning up..."
 
-  [ -n "${pids[*]}" ] && kill "${pids[@]}" >/dev/null 2>&1
-  [ -n "$vlc_pid" ] && kill $vlc_pid >/dev/null 2>&1
+  if [ -n "${pids[*]}" ]; then
+    kill "${pids[@]}" >/dev/null 2>&1
+  fi
+
+  if [ -n "$vlc_pid" ]; then
+    kill $vlc_pid >/dev/null 2>&1
+  fi
 
   stop_spinner
 
@@ -28,14 +34,17 @@ start_spinner() {
 }
 
 stop_spinner() {
-  [ -n "$spinner_pid" ] && kill $spinner_pid >/dev/null 2>&1 && wait $spinner_pid 2>/dev/null
+  if [ -n "$spinner_pid" ]; then
+    kill $spinner_pid >/dev/null 2>&1
+    wait $spinner_pid 2>/dev/null
+  fi
 }
 
 get_anime() {
   local result=$(curl -s "${api}/animes" | jq -r .data)
   local title=$(echo "$result" | jq -r '.[].title' | fzf)
 
-  if [[ -z $title ]]; then
+  if [ -z "$title" ]; then
     echo "No anime selected. Exiting."
     exit 1
   fi
@@ -84,7 +93,7 @@ create_playlist() {
   local folder="$1"
   local playlist_path="$folder/playlist.m3u8"
 
-  if [[ ! -d $folder ]]; then
+  if [ ! -d "$folder" ]; then
     echo "Folder '$folder' does not exist."
     exit 1
   fi
@@ -101,7 +110,7 @@ download() {
   local folder="${2:-.}" # Default to current directory if folder not specified
   local anime=$(get_anime)
 
-  if [[ -z $anime ]]; then
+  if [ -z "$anime" ]; then
     echo "Please select an anime"
     exit 1
   fi
@@ -110,14 +119,14 @@ download() {
   local anime_title=$(echo "$anime" | jq -r ".data.title" | sed 's/"/\\"/g')
   local selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
 
-  if [[ -z $selected_episodes ]]; then
+  if [ -z "$selected_episodes" ]; then
     echo "You must select at least one episode"
     exit 1
   fi
 
   local lang=$(gum choose --height 4 --header "Language" {vf,vostfr})
 
-  if [[ -z $lang ]]; then
+  if [ -z "$lang" ]; then
     echo "Language selection required"
     exit 1
   fi
@@ -155,11 +164,12 @@ print_usage() {
 }
 
 watch_anime() {
-  local folder="${1:-.}" # Default to current directory if folder not specified
+  local folder="${1:-.}" # Default to current directory if not specified
+  folder=$(realpath "$folder")
 
   local anime_progress_file="$folder/progress.txt"
 
-  if [[ ! -f $anime_progress_file ]]; then
+  if [ ! -f "$anime_progress_file" ]; then
     echo "No progress file found in $folder. Creating a new one."
     echo "1" >"$anime_progress_file"
     echo "0" >>"$anime_progress_file"
@@ -171,45 +181,39 @@ watch_anime() {
   local anime_title=$(ls "$folder" | head -n 1)
   local playlist_path="$folder/playlist.m3u8"
 
-  if [[ ! -f $playlist_path ]]; then
+  if [ ! -f "$playlist_path" ]; then
     echo "Playlist file $playlist_path not found."
     exit 1
   fi
 
+  # Create a temporary file for the updated playlist
   local playlist_tmp=$(mktemp)
   echo "#EXTM3U" >"$playlist_tmp"
 
   local found_current_episode=false
-  while IFS= read -r ep_file; do
-    if [[ $found_current_episode == true ]]; then
+  for ep_file in $(cat "$playlist_path"); do
+    if [ "$found_current_episode" = true ]; then
       echo "$ep_file" >>"$playlist_tmp"
-    elif [[ $ep_file == *"episode_${episode_num}.mp4"* ]]; then
+    elif [[ "$ep_file" == *"episode_${episode_num}.mp4"* ]]; then
       echo "$ep_file" >>"$playlist_tmp"
       found_current_episode=true
     fi
-  done <"$playlist_path"
+  done
 
-  # Start VLC with HTTP interface enabled and playlist
-  vlc --extraintf http --http-password "$vlc_password" --start-time="$time_pos" "$playlist_tmp" >"$folder/vlc.log" 2>&1 &
+  # Start VLC with the HTTP interface enabled and playlist
+  vlc --extraintf http --http-password "$vlc_password" "$playlist_tmp" >"$folder/vlc.log" 2>&1 &
   vlc_pid=$!
 
-  echo "VLC started with PID $vlc_pid."
-
   while :; do
-    sleep 10
     if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
-      time_pos=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r .time)
-      episode_num=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r '.information.category.meta.filename' | grep -o 'episode_[0-9]*' | grep -o '[0-9]*')
-      if [[ -n "$time_pos" && -n "$episode_num" ]]; then
-        save_progress "$folder" "$episode_num" "$time_pos"
-      else
-        echo "Failed to get time position or episode number from VLC."
-      fi
-    else
-      echo "Unable to connect to VLC HTTP interface. VLC might not have started properly."
+      seek_vlc_to_time "$time_pos"
       break
     fi
+    sleep 1
+  done
 
+  while :; do
+    check_and_reset_vlc_time "$folder"
     # Check if VLC is still running
     if ! kill -0 $vlc_pid 2>/dev/null; then
       echo "VLC process has ended."
@@ -218,7 +222,39 @@ watch_anime() {
   done
 
   wait $vlc_pid
-  echo "VLC has exited. Last saved time position: $time_pos seconds."
+  echo "VLC has exited."
+}
+
+seek_vlc_to_time() {
+  local time_pos="$1"
+  if [ -n "$time_pos" ] && [ "$time_pos" -ne 0 ]; then
+    curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json?command=seek&val=$time_pos" >/dev/null
+  fi
+}
+
+check_and_reset_vlc_time() {
+  local folder="$1"
+  local anime_progress_file="$folder/progress.txt"
+
+  if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
+    local new_time_pos=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r .time)
+    local new_episode_num=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r '.information.category.meta.filename' | grep -o 'episode_[0-9]*' | grep -o '[0-9]*')
+
+    if [ -n "$new_episode_num" ]; then
+      if [ "$new_episode_num" != "$(sed -n '1p' "$anime_progress_file")" ]; then
+        # Episode has changed, reset time position to 0 for the new episode
+        save_progress "$folder" "$new_episode_num" 0
+      else
+        # Save the current time position for the current episode
+        save_progress "$folder" "$new_episode_num" "$new_time_pos"
+      fi
+    else
+      echo "Failed to get episode number from VLC."
+    fi
+  else
+    echo "Unable to connect to VLC HTTP interface. VLC might not have started properly."
+    exit 1
+  fi
 }
 
 save_progress() {
@@ -236,7 +272,7 @@ download)
   download "$@"
   ;;
 playlist)
-  if [[ -z $2 ]]; then
+  if [ -z "$2" ]; then
     echo "Please specify the folder."
     exit 1
   fi
