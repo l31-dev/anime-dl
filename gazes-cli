@@ -1,19 +1,24 @@
 #!/bin/bash
 
+# VLC password and API endpoint
 vlc_password="your_vlc_password" # Set your VLC password here
 api="https://api.gazes.fr/anime"
 
+# Arrays to store process IDs
 pids=()
 spinner_pid=""
 vlc_pid=""
 
+# Cleanup function to terminate all child processes and clean up resources
 cleanup() {
   echo "Cleaning up..."
 
+  # Kill all stored process IDs
   if [ -n "${pids[*]}" ]; then
     kill "${pids[@]}" >/dev/null 2>&1
   fi
 
+  # Kill VLC process if it exists
   if [ -n "$vlc_pid" ]; then
     kill $vlc_pid >/dev/null 2>&1
   fi
@@ -25,14 +30,17 @@ cleanup() {
   exit 1
 }
 
+# Trap SIGINT and SIGTERM to execute the cleanup function
 trap 'cleanup' SIGINT SIGTERM
 
+# Start a spinner using gum to indicate downloading progress
 start_spinner() {
   local message="Downloading $total_episodes episodes..."
   gum spin --spinner dot --title "$message" -- sleep infinity &
   spinner_pid=$!
 }
 
+# Stop the spinner
 stop_spinner() {
   if [ -n "$spinner_pid" ]; then
     kill $spinner_pid >/dev/null 2>&1
@@ -40,10 +48,15 @@ stop_spinner() {
   fi
 }
 
+# Fetch and select anime from the API using fzf for interactive selection
 get_anime() {
   local result=$(curl -s "${api}/animes" | jq -r .data)
-  local title=$(echo "$result" | jq -r '.[].title' | fzf)
+  if [ $? -ne 0 ]; then
+    echo "Failed to fetch anime data."
+    exit 1
+  fi
 
+  local title=$(echo "$result" | jq -r '.[].title' | fzf)
   if [ -z "$title" ]; then
     echo "No anime selected. Exiting."
     exit 1
@@ -56,10 +69,12 @@ get_anime() {
   echo "$anime"
 }
 
+# Sanitize filenames to ensure compatibility with file systems
 sanitize_filename() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]_-' | tr ' ' '_'
 }
 
+# Download an episode using ffmpeg and save to the specified folder
 download_episode() {
   local anime_title="$1"
   local episode_num="$2"
@@ -78,6 +93,7 @@ download_episode() {
   fi
 }
 
+# Update the playlist file with the new episode
 update_playlist() {
   local folder="$1"
   local anime_title="$2"
@@ -89,6 +105,7 @@ update_playlist() {
   done
 }
 
+# Create a playlist for all episodes in the specified folder
 create_playlist() {
   local folder="$1"
   local playlist_path="$folder/playlist.m3u8"
@@ -106,6 +123,7 @@ create_playlist() {
   echo "Playlist created at $playlist_path"
 }
 
+# Main download function to fetch and download selected anime episodes
 download() {
   local folder="${2:-.}" # Default to current directory if folder not specified
   local anime=$(get_anime)
@@ -158,11 +176,13 @@ download() {
   echo "Download completed."
 }
 
+# Print usage instructions
 print_usage() {
   echo "Usage: $0 download|playlist|watch [folder]"
   exit 1
 }
 
+# Function to watch anime using VLC and save the progress
 watch_anime() {
   local folder="${1:-.}" # Default to current directory if not specified
   folder=$(realpath "$folder")
@@ -225,6 +245,7 @@ watch_anime() {
   echo "VLC has exited."
 }
 
+# Seek VLC to a specific time position
 seek_vlc_to_time() {
   local time_pos="$1"
   if [ -n "$time_pos" ] && [ "$time_pos" -ne 0 ]; then
@@ -232,6 +253,7 @@ seek_vlc_to_time() {
   fi
 }
 
+# Check VLC time and save progress
 check_and_reset_vlc_time() {
   local folder="$1"
   local anime_progress_file="$folder/progress.txt"
@@ -257,6 +279,7 @@ check_and_reset_vlc_time() {
   fi
 }
 
+# Save progress to the progress file
 save_progress() {
   local folder="$1"
   local episode_num="$2"
@@ -267,6 +290,7 @@ save_progress() {
   echo "$time_pos" >>"$anime_progress_file"
 }
 
+# Main case statement to handle different commands: download, playlist, and watch
 case "$1" in
 download)
   download "$@"
