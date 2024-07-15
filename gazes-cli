@@ -154,55 +154,100 @@ print_usage() {
 
 watch_anime() {
   local folder="${1:-.}" # Default to current directory if folder not specified
-  local anime_progress_file="$folder/progress.txt"
 
-  if [[ ! -f $anime_progress_file ]]; then
-    echo "No progress file found in $folder. Creating a new one."
-    echo "1" >"$anime_progress_file"
-    echo "0" >>"$anime_progress_file"
-  fi
+  if [[ -z $1 ]]; then
+    local anime=$(get_anime)
 
-  local episode_num=$(sed -n '1p' "$anime_progress_file")
-  local time_pos=$(sed -n '2p' "$anime_progress_file")
+    if [[ -z $anime ]]; then
+      echo "Please select an anime"
+      exit 1
+    fi
 
-  local episode_file="$folder/episode_${episode_num}.mp4"
+    local anime_id=$(echo "$anime" | jq -r ".data.id")
+    local anime_title=$(echo "$anime" | jq -r ".data.title" | sed 's/"/\\"/g')
+    local selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
 
-  if [[ ! -f $episode_file ]]; then
-    echo "Episode file $episode_file not found."
-    exit 1
-  fi
+    if [[ -z $selected_episodes ]]; then
+      echo "You must select at least one episode"
+      exit 1
+    fi
 
-  echo "Resuming episode $episode_num at $time_pos seconds."
+    local lang=$(gum choose --height 4 --header "Language" {vf,vostfr})
 
-  # Start VLC with HTTP interface enabled
-  vlc --extraintf http --http-password "$vlc_password" --start-time="$time_pos" "$episode_file" >"$folder/vlc.log" 2>&1 &
-  vlc_pid=$!
+    if [[ -z $lang ]]; then
+      echo "Language selection required"
+      exit 1
+    fi
 
-  echo "VLC started with PID $vlc_pid."
+    IFS=$'\n' read -r -d '' -a episodes <<<"$selected_episodes"
 
-  while :; do
-    sleep 10
-    if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
-      time_pos=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r .time)
-      if [[ -n "$time_pos" ]]; then
-        save_progress "$folder" "$episode_num" "$time_pos"
+    tmp=$(mktemp)
+    echo "#EXTM3U" >"$tmp"
+
+    for episode in "${episodes[@]}"; do
+      local episode_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .num")
+      local episode_full=$(curl -s "${api}/animes/${anime_id}/${episode_num}")
+      local episode_url=$(echo "$episode_full" | jq -r ".data.${lang}.videoUri // .data.vostfr.videoUri")
+
+      if curl --output /dev/null --silent --head --fail "$episode_url"; then
+        echo "$episode_url" >>"$tmp"
       else
-        echo "Failed to get time position from VLC."
+        echo "Episode URL $episode_url not accessible."
       fi
-    else
-      echo "Unable to connect to VLC HTTP interface. VLC might not have started properly."
-      break
+    done
+
+    vlc "$tmp" >/dev/null 2>&1
+  else
+    local anime_progress_file="$folder/progress.txt"
+
+    if [[ ! -f $anime_progress_file ]]; then
+      echo "No progress file found in $folder. Creating a new one."
+      echo "1" >"$anime_progress_file"
+      echo "0" >>"$anime_progress_file"
     fi
 
-    # Check if VLC is still running
-    if ! kill -0 $vlc_pid 2>/dev/null; then
-      echo "VLC process has ended."
-      break
-    fi
-  done
+    local episode_num=$(sed -n '1p' "$anime_progress_file")
+    local time_pos=$(sed -n '2p' "$anime_progress_file")
 
-  wait $vlc_pid
-  echo "VLC has exited. Last saved time position: $time_pos seconds."
+    local episode_file="$folder/episode_${episode_num}.mp4"
+
+    if [[ ! -f $episode_file ]]; then
+      echo "Episode file $episode_file not found."
+      exit 1
+    fi
+
+    echo "Resuming episode $episode_num at $time_pos seconds."
+
+    # Start VLC with HTTP interface enabled
+    vlc --extraintf http --http-password "$vlc_password" --start-time="$time_pos" "$episode_file" >"$folder/vlc.log" 2>&1 &
+    vlc_pid=$!
+
+    echo "VLC started with PID $vlc_pid."
+
+    while :; do
+      sleep 10
+      if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
+        time_pos=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r .time)
+        if [[ -n "$time_pos" ]]; then
+          save_progress "$folder" "$episode_num" "$time_pos"
+        else
+          echo "Failed to get time position from VLC."
+        fi
+      else
+        echo "Unable to connect to VLC HTTP interface. VLC might not have started properly."
+        break
+      fi
+
+      # Check if VLC is still running
+      if ! kill -0 $vlc_pid 2>/dev/null; then
+        echo "VLC process has ended."
+        break
+      fi
+    done
+
+    wait $vlc_pid
+    echo "VLC has exited. Last saved time position: $time_pos seconds."
+  fi
 }
 
 save_progress() {
@@ -227,10 +272,6 @@ playlist)
   create_playlist "$2"
   ;;
 watch)
-  if [[ -z $2 ]]; then
-    echo "Please specify the folder."
-    exit 1
-  fi
   watch_anime "$2"
   ;;
 *)
