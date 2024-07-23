@@ -7,7 +7,6 @@ api="https://api.gazes.fr/anime"
 # Arrays to store process IDs
 pids=()
 spinner_pid=""
-vlc_pid=""
 
 # Cleanup function to terminate all child processes and clean up resources
 cleanup() {
@@ -16,11 +15,6 @@ cleanup() {
   # Kill all stored process IDs
   if [ -n "${pids[*]}" ]; then
     kill "${pids[@]}" >/dev/null 2>&1
-  fi
-
-  # Kill VLC process if it exists
-  if [ -n "$vlc_pid" ]; then
-    kill $vlc_pid >/dev/null 2>&1
   fi
 
   stop_spinner
@@ -43,27 +37,31 @@ start_spinner() {
 # Stop the spinner
 stop_spinner() {
   if [ -n "$spinner_pid" ]; then
-    kill $spinner_pid >/dev/null 2>&1
-    wait $spinner_pid 2>/dev/null
+    kill "$spinner_pid" >/dev/null 2>&1
+    wait "$spinner_pid" 2>/dev/null
   fi
 }
 
 # Fetch and select anime from the API using fzf for interactive selection
 get_anime() {
-  local result=$(curl -s "${api}/animes" | jq -r .data)
+  local result
+  result=$(curl -s "${api}/animes" | jq -r .data)
   if [ $? -ne 0 ]; then
     echo "Failed to fetch anime data."
     exit 1
   fi
 
-  local title=$(echo "$result" | jq -r '.[].title' | fzf)
+  local title
+  title=$(echo "$result" | jq -r '.[].title' | fzf)
   if [ -z "$title" ]; then
     echo "No anime selected. Exiting."
     exit 1
   fi
 
-  local anime=$(echo "$result" | jq -r ".[] | select(.title == \"$title\")")
-  local anime_id=$(echo "$anime" | jq -r ".id")
+  local anime
+  anime=$(echo "$result" | jq -r ".[] | select(.title == \"$title\")")
+  local anime_id
+  anime_id=$(echo "$anime" | jq -r ".id")
   anime=$(curl -s "${api}/animes/${anime_id}")
 
   echo "$anime"
@@ -77,17 +75,18 @@ sanitize_filename() {
 # Download an episode using ffmpeg and save to the specified folder
 download_episode() {
   local anime_title="$1"
-  local episode_num="$2"
-  local episode_url="$3"
-  local folder="$4"
+  local season_num="$2"
+  local episode_num="$3"
+  local episode_url="$4"
+  local folder="$5"
 
-  local sanitized_title=$(sanitize_filename "$anime_title")
-  local output_file="$folder/$sanitized_title/episode_${episode_num}.mp4"
-  mkdir -p "$folder/$sanitized_title"
+  local output_file
+  output_file="$folder/$anime_title/$(printf "%s S%02dE%02d.mp4" "$anime_title" "$season_num" "$episode_num")"
+  mkdir -p "$folder/$anime_title"
 
   if ffmpeg -loglevel error -i "$episode_url" -c copy "$output_file"; then
     echo "Downloaded episode $episode_num successfully."
-    update_playlist "$folder" "$sanitized_title"
+    update_playlist "$folder" "$anime_title"
   else
     echo "Failed to download episode $episode_num."
   fi
@@ -126,23 +125,28 @@ create_playlist() {
 # Main download function to fetch and download selected anime episodes
 download() {
   local folder="${2:-.}" # Default to current directory if folder not specified
-  local anime=$(get_anime)
+  local anime
+  anime=$(get_anime)
 
   if [ -z "$anime" ]; then
     echo "Please select an anime"
     exit 1
   fi
 
-  local anime_id=$(echo "$anime" | jq -r ".data.id")
-  local anime_title=$(echo "$anime" | jq -r ".data.title" | sed 's/"/\\"/g')
-  local selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
+  local anime_id
+  anime_id=$(echo "$anime" | jq -r ".data.id")
+  local anime_title
+  anime_title=$(echo "$anime" | jq -r ".data.title" | sed 's/"/\\"/g')
+  local selected_episodes
+  selected_episodes=$(echo "$anime" | jq -r ".data.episodes[].title" | gum choose --no-limit --header "Choose episodes to download")
 
   if [ -z "$selected_episodes" ]; then
     echo "You must select at least one episode"
     exit 1
   fi
 
-  local lang=$(gum choose --height 4 --header "Language" {vf,vostfr})
+  local lang
+  lang=$(gum choose --height 4 --header "Language" {vf,vostfr})
 
   if [ -z "$lang" ]; then
     echo "Language selection required"
@@ -157,12 +161,17 @@ download() {
 
   for episode in "${episodes[@]}"; do
     (
-      local episode_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .num")
-      local episode_full=$(curl -s "${api}/animes/${anime_id}/${episode_num}")
-      local episode_url=$(echo "$episode_full" | jq -r ".data.${lang}.videoUri // .data.vostfr.videoUri")
+      local episode_num
+      episode_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .num")
+      local season_num
+      season_num=$(echo "$anime" | jq -r ".data.episodes[] | select(.title == \"$episode\") | .season // 1") # Default season to 1 if not available
+      local episode_full
+      episode_full=$(curl -s "${api}/animes/${anime_id}/${episode_num}")
+      local episode_url
+      episode_url=$(echo "$episode_full" | jq -r ".data.${lang}.videoUri // .data.vostfr.videoUri")
 
       if curl --output /dev/null --silent --head --fail "$episode_url"; then
-        download_episode "$anime_title" "$episode_num" "$episode_url" "$folder"
+        download_episode "$anime_title" "$season_num" "$episode_num" "$episode_url" "$folder"
       else
         echo "Episode URL $episode_url not accessible."
       fi
@@ -178,119 +187,11 @@ download() {
 
 # Print usage instructions
 print_usage() {
-  echo "Usage: $0 download|playlist|watch [folder]"
+  echo "Usage: $0 download|playlist [folder]"
   exit 1
 }
 
-# Function to watch anime using VLC and save the progress
-watch_anime() {
-  local folder="${1:-.}" # Default to current directory if not specified
-  folder=$(realpath "$folder")
-
-  local anime_progress_file="$folder/progress.txt"
-
-  if [ ! -f "$anime_progress_file" ]; then
-    echo "No progress file found in $folder. Creating a new one."
-    echo "1" >"$anime_progress_file"
-    echo "0" >>"$anime_progress_file"
-  fi
-
-  local episode_num=$(sed -n '1p' "$anime_progress_file")
-  local time_pos=$(sed -n '2p' "$anime_progress_file")
-
-  local anime_title=$(ls "$folder" | head -n 1)
-  local playlist_path="$folder/playlist.m3u8"
-
-  if [ ! -f "$playlist_path" ]; then
-    echo "Playlist file $playlist_path not found."
-    exit 1
-  fi
-
-  # Create a temporary file for the updated playlist
-  local playlist_tmp=$(mktemp)
-  echo "#EXTM3U" >"$playlist_tmp"
-
-  local found_current_episode=false
-  for ep_file in $(cat "$playlist_path"); do
-    if [ "$found_current_episode" = true ]; then
-      echo "$ep_file" >>"$playlist_tmp"
-    elif [[ "$ep_file" == *"episode_${episode_num}.mp4"* ]]; then
-      echo "$ep_file" >>"$playlist_tmp"
-      found_current_episode=true
-    fi
-  done
-
-  # Start VLC with the HTTP interface enabled and playlist
-  vlc --extraintf http --http-password "$vlc_password" "$playlist_tmp" >"$folder/vlc.log" 2>&1 &
-  vlc_pid=$!
-
-  while :; do
-    if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
-      seek_vlc_to_time "$time_pos"
-      break
-    fi
-    sleep 1
-  done
-
-  while :; do
-    check_and_reset_vlc_time "$folder"
-    # Check if VLC is still running
-    if ! kill -0 $vlc_pid 2>/dev/null; then
-      echo "VLC process has ended."
-      break
-    fi
-  done
-
-  wait $vlc_pid
-  echo "VLC has exited."
-}
-
-# Seek VLC to a specific time position
-seek_vlc_to_time() {
-  local time_pos="$1"
-  if [ -n "$time_pos" ] && [ "$time_pos" -ne 0 ]; then
-    curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json?command=seek&val=$time_pos" >/dev/null
-  fi
-}
-
-# Check VLC time and save progress
-check_and_reset_vlc_time() {
-  local folder="$1"
-  local anime_progress_file="$folder/progress.txt"
-
-  if curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -e . >/dev/null 2>&1; then
-    local new_time_pos=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r .time)
-    local new_episode_num=$(curl -s --user ":$vlc_password" "http://localhost:8080/requests/status.json" | jq -r '.information.category.meta.filename' | grep -o 'episode_[0-9]*' | grep -o '[0-9]*')
-
-    if [ -n "$new_episode_num" ]; then
-      if [ "$new_episode_num" != "$(sed -n '1p' "$anime_progress_file")" ]; then
-        # Episode has changed, reset time position to 0 for the new episode
-        save_progress "$folder" "$new_episode_num" 0
-      else
-        # Save the current time position for the current episode
-        save_progress "$folder" "$new_episode_num" "$new_time_pos"
-      fi
-    else
-      echo "Failed to get episode number from VLC."
-    fi
-  else
-    echo "Unable to connect to VLC HTTP interface. VLC might not have started properly."
-    exit 1
-  fi
-}
-
-# Save progress to the progress file
-save_progress() {
-  local folder="$1"
-  local episode_num="$2"
-  local time_pos="$3"
-
-  local anime_progress_file="$folder/progress.txt"
-  echo "$episode_num" >"$anime_progress_file"
-  echo "$time_pos" >>"$anime_progress_file"
-}
-
-# Main case statement to handle different commands: download, playlist, and watch
+# Main case statement to handle different commands: download and playlist
 case "$1" in
 download)
   download "$@"
@@ -302,10 +203,8 @@ playlist)
   fi
   create_playlist "$2"
   ;;
-watch)
-  watch_anime "$2"
-  ;;
 *)
   print_usage
   ;;
 esac
+
